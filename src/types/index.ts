@@ -17,6 +17,8 @@ export interface Message {
   edited?: boolean;
   deleted?: boolean;
   reactions?: MessageReaction[];
+  /** Ids of users who have read the message (sender included). */
+  readBy?: string[];
 }
 
 export interface MessageReaction {
@@ -39,6 +41,7 @@ export interface Group {
   name: string;
   members: User[];
   createdBy: string;
+  createdAt?: string;
   lastMessage?: Message;
   unreadCount?: number;
   updatedAt: string;
@@ -61,5 +64,5 @@ export interface TypingUpdate {
 export interface PresenceUpdate {
   userId: string;
   isOnline: boolean;
-  lastSeen: string;
+  lastSeen: string | null;
 }

@@ -1,20 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
-import {
-  Alert,
-  Avatar,
-  Badge,
-  Box,
-  Button,
-  CircularProgress,
-  IconButton,
-  TextField,
-  Typography,
-  useMediaQuery,
-  useTheme,
-} from "@mui/material";
-import SendIcon from "@mui/icons-material/Send";
-import ArrowBackIcon from "@mui/icons-material/ArrowBack";
-import GroupIcon from "@mui/icons-material/Group";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import { Box, ButtonBase, CircularProgress, Typography } from "@mui/material";
+import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import ChatBubbleOutlinedIcon from "@mui/icons-material/ChatBubbleOutlined";
 import { getConversationMessages } from "../api/conversations";
 import { getGroupMessages } from "../api/groups";
 import { useAuth } from "../context/AuthContext";
@@ -22,9 +9,15 @@ import { useChat } from "../context/ChatContext";
 import { useSocket } from "../context/SocketContext";
 import { threadLabel, threadOtherUser } from "../utils/thread";
 import { normalizeIds } from "../utils/normalize";
+import { apiError } from "../utils/apiError";
+import { dayLabel } from "../utils/time";
 import { deleteMessage, editMessage, reactToMessage } from "../api/messages";
+import { colors, gradients, radii, shadows } from "../theme";
 import { MessageBubble } from "./MessageBubble";
-import { GroupInfoDialog } from "./GroupInfoDialog";
+import { ChatHeader } from "./chat/ChatHeader";
+import { Composer } from "./chat/Composer";
+import { TypingIndicator } from "./chat/TypingIndicator";
+import { ChatSkeleton, ConnectionBanner, DatePill, EmptyChat, ForbiddenCard, HistoryErrorCard, UnreadDivider } from "./chat/ChatStates";
 import type { Message, TypingUpdate } from "../types";
 
 const TYPING_STOP_DELAY_MS = 2000;
@@ -32,23 +25,30 @@ const TYPING_STOP_DELAY_MS = 2000;
 const TYPING_STALE_MS = 4000;
 const MESSAGES_PAGE_LIMIT = 30;
 
-export function ChatWindow() {
+interface ChatWindowProps {
+  membersOpen?: boolean;
+  onToggleMembers?: () => void;
+  /** Mobile: full-screen chat with a back chevron and pill composer. */
+  mobile?: boolean;
+}
+
+export function ChatWindow({ membersOpen = false, onToggleMembers = () => {}, mobile = false }: ChatWindowProps) {
   const { user } = useAuth();
-  const { activeThread, setActiveThread, onlineUserIds, refresh } = useChat();
-  const { socket, connected } = useSocket();
-  const theme = useTheme();
-  const isMobile = useMediaQuery(theme.breakpoints.down("sm"));
+  const { activeThread, setActiveThread, onlineUserIds, refresh, lastSeenById } = useChat();
+  const { socket, status, reconnectAttempt, reconnect } = useSocket();
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; status?: number } | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [draft, setDraft] = useState("");
   const [typingUserIds, setTypingUserIds] = useState<Set<string>>(new Set());
-  const [groupInfoOpen, setGroupInfoOpen] = useState(false);
   const [hasNewMessagesBelow, setHasNewMessagesBelow] = useState(false);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [firstUnreadId, setFirstUnreadId] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const isNearBottomRef = useRef(true);
   const pageRef = useRef(1);
   const pendingScrollAdjustRef = useRef<number | null>(null);
@@ -59,12 +59,17 @@ export function ChatWindow() {
 
   const threadId = activeThread?.id;
   const isGroup = !!activeThread?.isGroup;
+  // Unread count as it was when this thread was opened, before it gets marked read.
+  const unreadAtOpenRef = useRef(0);
+  unreadAtOpenRef.current = activeThread?.unreadCount ?? 0;
 
   useEffect(() => {
     if (!threadId) return;
     let active = true;
+    const unreadAtOpen = unreadAtOpenRef.current;
     setLoading(true);
     setError(null);
+    setFirstUnreadId(null);
     pageRef.current = 1;
     const fetcher = isGroup
       ? getGroupMessages(threadId, 1, MESSAGES_PAGE_LIMIT)
@@ -74,9 +79,12 @@ export function ChatWindow() {
         if (!active) return;
         setMessages(data);
         setHasMoreHistory(data.length === MESSAGES_PAGE_LIMIT);
+        if (unreadAtOpen > 0 && unreadAtOpen < data.length) {
+          setFirstUnreadId(data[data.length - unreadAtOpen]?.id ?? null);
+        }
       })
-      .catch(() => {
-        if (active) setError("Failed to load messages");
+      .catch((err) => {
+        if (active) setError(apiError(err, "Failed to load messages"));
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -84,7 +92,7 @@ export function ChatWindow() {
     return () => {
       active = false;
     };
-  }, [threadId, isGroup]);
+  }, [threadId, isGroup, reloadKey]);
 
   function handleLoadOlder() {
     if (!threadId || loadingMore) return;
@@ -142,6 +150,7 @@ export function ChatWindow() {
   useEffect(() => {
     isNearBottomRef.current = true;
     setHasNewMessagesBelow(false);
+    setDraft("");
   }, [threadId]);
 
   function handleScroll() {
@@ -170,6 +179,13 @@ export function ChatWindow() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to new messages arriving, not edits/reactions changing the array reference
   }, [messages.length, user?.id]);
+
+  // Keep the typing indicator in view if the user is already at the bottom.
+  useEffect(() => {
+    if (typingUserIds.size > 0 && isNearBottomRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [typingUserIds.size]);
 
   function scrollToBottom() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -298,14 +314,14 @@ export function ChatWindow() {
     }
   }
 
-  function handleReact(messageId: string, emoji: string) {
+  const handleReact = useCallback((messageId: string, emoji: string) => {
     reactToMessage(messageId, emoji).catch(() => {
       // message:reaction_updated is the source of truth; a failed request
       // just means the optimistic-free UI doesn't change, no error state needed.
     });
-  }
+  }, []);
 
-  function handleEditMessage(messageId: string, content: string) {
+  const handleEditMessage = useCallback((messageId: string, content: string) => {
     editMessage(messageId, content)
       .then(({ data }) => {
         setMessages((prev) => prev.map((m) => (m.id === data.id ? data : m)));
@@ -315,9 +331,9 @@ export function ChatWindow() {
         // so a transient failure here just means this optimistic path missed —
         // the socket event (if the request actually succeeded) still lands.
       });
-  }
+  }, []);
 
-  function handleDeleteMessage(messageId: string) {
+  const handleDeleteMessage = useCallback((messageId: string) => {
     deleteMessage(messageId)
       .then(() => {
         setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, deleted: true } : m)));
@@ -325,197 +341,178 @@ export function ChatWindow() {
       .catch(() => {
         // Same reasoning as handleEditMessage above.
       });
-  }
+  }, []);
+
+  const roster = activeThread ? (activeThread.isGroup ? activeThread.members : activeThread.participants) : [];
+  const resolveUsername = useCallback(
+    (userId: string): string => roster.find((member) => member.id === userId)?.username ?? "Someone",
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- roster identity changes with the thread
+    [activeThread]
+  );
 
   if (!activeThread) {
     return (
-      <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%" }}>
-        <Typography color="text.secondary">Select a conversation to start chatting</Typography>
+      <Box sx={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 1.5, bgcolor: colors.surface, px: 3, textAlign: "center" }}>
+        <Box sx={{ width: 88, height: 88, borderRadius: "50%", background: gradients.softPrimary, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <ChatBubbleOutlinedIcon sx={{ fontSize: 36, color: colors.primary }} />
+        </Box>
+        <Typography variant="h6" component="p">
+          Select a conversation
+        </Typography>
+        <Typography sx={{ fontSize: 14, color: colors.textSecondary }}>Pick a chat from the list, or start a new one.</Typography>
       </Box>
     );
   }
 
-  const roster = activeThread.isGroup ? activeThread.members : activeThread.participants;
-  function resolveUsername(userId: string): string {
-    return roster.find((member) => member.id === userId)?.username ?? "Someone";
-  }
-
+  const title = threadLabel(activeThread, user?.id);
   const otherUser = threadOtherUser(activeThread, user?.id);
   const otherOnline = otherUser ? onlineUserIds.has(otherUser.id) : false;
+  const otherLastSeen = otherUser ? lastSeenById[otherUser.id] ?? otherUser.lastSeen : undefined;
+  const onlineMemberCount = activeThread.isGroup
+    ? activeThread.members.filter((m) => m.id === user?.id || onlineUserIds.has(m.id)).length
+    : 0;
 
-  const typingNames = Array.from(typingUserIds)
-    .map((id) => {
-      if (activeThread.isGroup) return activeThread.members.find((m) => m.id === id)?.username;
-      return otherUser?.id === id ? otherUser.username : undefined;
-    })
-    .filter((name): name is string => !!name);
-  const typingLabel =
-    typingNames.length === 0
-      ? null
-      : typingNames.length === 1
-        ? `${typingNames[0]} is typing…`
-        : `${typingNames.join(", ")} are typing…`;
+  const typingUsers = Array.from(typingUserIds)
+    .map((id) => roster.find((m) => m.id === id))
+    .filter((m): m is NonNullable<typeof m> => !!m);
+
+  // Everyone except me must have read an outgoing message for the double tick.
+  const otherMemberIds = roster.filter((m) => m.id !== user?.id).map((m) => m.id);
+  function readStateOf(message: Message): "sent" | "read" {
+    const readBy = message.readBy ?? [];
+    return otherMemberIds.length > 0 && otherMemberIds.every((id) => readBy.includes(id)) ? "read" : "sent";
+  }
+
+  const bubbleMaxWidth = membersOpen ? 380 : 460;
+  const firstName = title.split(/\s+/)[0];
+  const isForbidden = error?.status === 403;
 
   return (
-    <Box sx={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
-      <Box
-        sx={{
-          display: "flex",
-          alignItems: "center",
-          gap: 1.5,
-          px: 2,
-          py: 1.5,
-          borderBottom: 1,
-          borderColor: "divider",
-          flexShrink: 0,
-        }}
-      >
-        {isMobile && (
-          <IconButton size="small" edge="start" onClick={() => setActiveThread(null)}>
-            <ArrowBackIcon fontSize="small" />
-          </IconButton>
-        )}
+    <Box component="section" aria-label={`Chat with ${title}`} sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", height: "100%", minHeight: 0, bgcolor: colors.surface }}>
+      <ChatHeader
+        thread={activeThread}
+        title={title}
+        otherUser={otherUser}
+        otherOnline={otherOnline}
+        otherLastSeen={otherLastSeen}
+        typing={!activeThread.isGroup && typingUsers.length > 0}
+        onlineMemberCount={onlineMemberCount}
+        membersOpen={membersOpen}
+        onToggleMembers={onToggleMembers}
+        onBack={mobile ? () => setActiveThread(null) : undefined}
+        compact={mobile}
+      />
+
+      <ConnectionBanner status={status} attempt={reconnectAttempt} onRetry={reconnect} />
+
+      <Box sx={{ flex: 1, minHeight: 0, position: "relative" }}>
         <Box
-          onClick={() => activeThread.isGroup && setGroupInfoOpen(true)}
-          sx={{
-            display: "flex",
-            alignItems: "center",
-            gap: 1.5,
-            cursor: activeThread.isGroup ? "pointer" : "default",
-          }}
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          sx={{ height: "100%", overflowY: "auto", overflowX: "hidden" }}
         >
-          {activeThread.isGroup ? (
-            <Avatar>
-              <GroupIcon fontSize="small" />
-            </Avatar>
-          ) : (
-            <Badge
-              overlap="circular"
-              anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
-              variant="dot"
-              color={otherOnline ? "success" : "default"}
-            >
-              <Avatar>{threadLabel(activeThread, user?.id)[0]?.toUpperCase()}</Avatar>
-            </Badge>
-          )}
-          <Box>
-            <Typography sx={{ fontWeight: 600 }}>{threadLabel(activeThread, user?.id)}</Typography>
-            <Typography variant="caption" color="text.secondary">
-              {activeThread.isGroup
-                ? `${activeThread.members.length} members`
-                : otherOnline
-                  ? "Online"
-                  : "Offline"}
-            </Typography>
+          <Box
+            role="log"
+            aria-live="polite"
+            aria-relevant="additions"
+            sx={{ minHeight: "100%", display: "flex", flexDirection: "column", gap: 1.5, px: { xs: 1.5, sm: 2.5, md: 4 }, pt: 2.5, pb: 1 }}
+          >
+            {loading ? (
+              <ChatSkeleton />
+            ) : isForbidden ? (
+              <ForbiddenCard name={title} onBack={() => setActiveThread(null)} />
+            ) : error ? (
+              <HistoryErrorCard detail={`${error.message}${error.status ? ` · ${error.status}` : ""}`} onRetry={() => setReloadKey((k) => k + 1)} />
+            ) : messages.length === 0 ? (
+              <EmptyChat
+                name={activeThread.isGroup ? title : firstName}
+                starters={activeThread.isGroup ? ["👋 Hi everyone!", "What's everyone working on?"] : [`👋 Hey ${firstName}!`, "How's it going?"]}
+                onPick={(text) => {
+                  handleDraftChange(text);
+                  composerRef.current?.focus();
+                }}
+              />
+            ) : (
+              <>
+                {/* Pushes a short history to the bottom, like the design. */}
+                <Box sx={{ flex: 1 }} />
+                {hasMoreHistory && (
+                  <Box sx={{ display: "flex", justifyContent: "center" }}>
+                    <ButtonBase
+                      onClick={handleLoadOlder}
+                      disabled={loadingMore}
+                      sx={{ px: 1.75, height: 30, borderRadius: `${radii.pill}px`, bgcolor: colors.paper, border: `1px solid ${colors.divider}`, fontSize: 12, fontWeight: 600, color: colors.textSecondary }}
+                    >
+                      {loadingMore ? <CircularProgress size={14} /> : "Load older messages"}
+                    </ButtonBase>
+                  </Box>
+                )}
+                {messages.map((message, i) => {
+                  const prev = messages[i - 1];
+                  const showDate = !prev || new Date(prev.createdAt).toDateString() !== new Date(message.createdAt).toDateString();
+                  const firstOfRun = showDate || !prev || prev.sender.id !== message.sender.id || message.id === firstUnreadId;
+                  const isOwn = message.sender.id === user?.id;
+                  return (
+                    <Box key={message.id} sx={{ display: "contents" }}>
+                      {showDate && <DatePill label={dayLabel(message.createdAt)} />}
+                      {message.id === firstUnreadId && <UnreadDivider count={messages.length - i} />}
+                      <MessageBubble
+                        message={message}
+                        isOwn={isOwn}
+                        currentUserId={user?.id}
+                        onReact={handleReact}
+                        onEdit={handleEditMessage}
+                        onDelete={handleDeleteMessage}
+                        resolveUsername={resolveUsername}
+                        isGroup={activeThread.isGroup}
+                        firstOfRun={firstOfRun}
+                        maxWidth={bubbleMaxWidth}
+                        readState={isOwn ? readStateOf(message) : undefined}
+                      />
+                    </Box>
+                  );
+                })}
+              </>
+            )}
+            {!loading && !error && <TypingIndicator users={typingUsers} showAvatars={activeThread.isGroup} />}
+            <div ref={bottomRef} />
           </Box>
         </Box>
-      </Box>
-
-      {activeThread.isGroup && (
-        <GroupInfoDialog
-          open={groupInfoOpen}
-          onClose={() => setGroupInfoOpen(false)}
-          group={activeThread}
-        />
-      )}
-
-      {!connected && (
-        <Alert severity="warning" sx={{ borderRadius: 0, flexShrink: 0 }}>
-          Reconnecting...
-        </Alert>
-      )}
-
-      <Box sx={{ flex: 1, minHeight: 0, position: "relative", overflow: "hidden" }}>
-      <Box
-        ref={scrollContainerRef}
-        onScroll={handleScroll}
-        sx={{ height: "100%", overflow: "auto", px: 2, py: 2 }}
-      >
-        {loading ? (
-          <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}>
-            <CircularProgress size={24} />
-          </Box>
-        ) : error ? (
-          <Alert severity="error">{error}</Alert>
-        ) : messages.length === 0 ? (
-          <Typography variant="body2" color="text.secondary" sx={{ textAlign: "center", mt: 4 }}>
-            No messages yet — say hello!
-          </Typography>
-        ) : (
-          <>
-            {hasMoreHistory && (
-              <Box sx={{ display: "flex", justifyContent: "center", mb: 1.5 }}>
-                <Button size="small" onClick={handleLoadOlder} disabled={loadingMore}>
-                  {loadingMore ? <CircularProgress size={16} /> : "Load older messages"}
-                </Button>
-              </Box>
-            )}
-            {messages.map((message) => (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              isOwn={message.sender.id === user?.id}
-              currentUserId={user?.id}
-              onReact={(emoji) => handleReact(message.id, emoji)}
-              onEdit={(content) => handleEditMessage(message.id, content)}
-              onDelete={() => handleDeleteMessage(message.id)}
-              resolveUsername={resolveUsername}
-            />
-            ))}
-          </>
-        )}
-        <div ref={bottomRef} />
-      </Box>
-      {hasNewMessagesBelow && (
-        <Button
-          size="small"
-          variant="contained"
-          onClick={scrollToBottom}
-          sx={{
-            position: "absolute",
-            bottom: 12,
-            left: "50%",
-            transform: "translateX(-50%)",
-            borderRadius: 5,
-          }}
-        >
-          New messages ↓
-        </Button>
-      )}
-      </Box>
-
-      <Box sx={{ px: 2, height: 20, flexShrink: 0 }}>
-        {typingLabel && (
-          <Typography variant="caption" color="text.secondary" sx={{ fontStyle: "italic" }}>
-            {typingLabel}
-          </Typography>
+        {hasNewMessagesBelow && (
+          <ButtonBase
+            onClick={scrollToBottom}
+            sx={{
+              position: "absolute",
+              bottom: 12,
+              left: "50%",
+              transform: "translateX(-50%)",
+              gap: 0.75,
+              px: 1.75,
+              height: 34,
+              borderRadius: `${radii.pill}px`,
+              background: gradients.primary,
+              boxShadow: shadows.primaryButton,
+              color: colors.white,
+              fontSize: 13,
+              fontWeight: 600,
+            }}
+          >
+            <ArrowDownwardIcon sx={{ fontSize: 15 }} />
+            New messages
+          </ButtonBase>
         )}
       </Box>
 
-      <Box
-        component="form"
-        onSubmit={handleSend}
-        sx={{
-          display: "flex",
-          gap: 1,
-          px: 2,
-          py: 1.5,
-          borderTop: 1,
-          borderColor: "divider",
-          flexShrink: 0,
-        }}
-      >
-        <TextField
-          fullWidth
-          size="small"
-          placeholder="Type a message"
+      {!isForbidden && (
+        <Composer
           value={draft}
-          onChange={(e) => handleDraftChange(e.target.value)}
+          onChange={handleDraftChange}
+          onSubmit={handleSend}
+          placeholder={mobile ? "Message" : `Message ${activeThread.isGroup ? title : firstName}…`}
+          inputRef={composerRef}
+          mobile={mobile}
         />
-        <IconButton type="submit" color="primary" disabled={!draft.trim()}>
-          <SendIcon />
-        </IconButton>
-      </Box>
+      )}
     </Box>
   );
 }

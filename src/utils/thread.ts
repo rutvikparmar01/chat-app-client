@@ -20,3 +20,32 @@ export function formatTimestamp(iso: string): string {
   }
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
+
+/** Resolve a sender that may arrive populated (`{id, username}`) or as a bare id. */
+function senderIdOf(sender: unknown): string | undefined {
+  if (typeof sender === "string") return sender;
+  if (sender && typeof sender === "object" && "id" in sender) return String((sender as { id: unknown }).id);
+  return undefined;
+}
+
+/**
+ * Sidebar preview line: "You: …" for your own messages, "Sender: …" in groups,
+ * plain text in direct chats.
+ */
+export function threadPreview(thread: ChatThread, currentUserId?: string): string {
+  const message = thread.lastMessage;
+  if (!message) return "No messages yet";
+  const body = message.deleted ? "Message deleted" : message.content;
+  const senderId = senderIdOf(message.sender);
+  if (senderId && senderId === currentUserId) return `You: ${body}`;
+  if (thread.isGroup) {
+    const populated = typeof message.sender === "object" ? message.sender?.username : undefined;
+    const name = populated ?? thread.members.find((m) => m.id === senderId)?.username;
+    return name ? `${name}: ${body}` : body;
+  }
+  return body;
+}
+
+export function threadMembers(thread: ChatThread): User[] {
+  return thread.isGroup ? thread.members : thread.participants;
+}

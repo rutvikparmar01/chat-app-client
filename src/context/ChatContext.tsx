@@ -3,7 +3,10 @@ import { getConversations } from "../api/conversations";
 import { useAuth } from "./AuthContext";
 import { useSocket } from "./SocketContext";
 import { normalizeIds } from "../utils/normalize";
-import type { ChatThread, Message, PresenceUpdate } from "../types";
+import type { ChatThread, Message, PresenceUpdate, TypingUpdate } from "../types";
+
+// Mirrors ChatWindow's safety net for dropped typing:stop events.
+const TYPING_STALE_MS = 4000;
 
 interface ChatContextValue {
   threads: ChatThread[];
@@ -14,7 +17,11 @@ interface ChatContextValue {
   setActiveThread: (thread: ChatThread | null) => void;
   onlineUserIds: Set<string>;
   upsertThreadFromMessage: (message: Message) => void;
-  seedOnline: (users: Array<{ id: string; isOnline?: boolean }>) => void;
+  seedOnline: (users: Array<{ id: string; isOnline?: boolean; lastSeen?: string | null }>) => void;
+  /** Last-seen timestamps from fetched users and `presence:update` events. */
+  lastSeenById: Record<string, string>;
+  /** Users currently typing, keyed by conversation/group id (for sidebar previews). */
+  typingByThread: Record<string, string[]>;
 }
 
 const ChatContext = createContext<ChatContextValue | undefined>(undefined);
@@ -27,13 +34,26 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [activeThread, setActiveThread] = useState<ChatThread | null>(null);
   const [onlineUserIds, setOnlineUserIds] = useState<Set<string>>(new Set());
+  const [lastSeenById, setLastSeenById] = useState<Record<string, string>>({});
+  const [typingByThread, setTypingByThread] = useState<Record<string, string[]>>({});
 
   // The `isOnline` flag on a user only arrives on the response that fetched
   // them (users list, conversation participants, group members) — presence
   // socket events only fire on future connect/disconnect. Seed the online
   // set from that flag so status is accurate on first paint, not just after
   // someone's connection state changes while we're already looking.
-  const seedOnline = useCallback((users: Array<{ id: string; isOnline?: boolean }>) => {
+  const seedOnline = useCallback((users: Array<{ id: string; isOnline?: boolean; lastSeen?: string | null }>) => {
+    const seen = users.filter((u) => u.lastSeen);
+    if (seen.length > 0) {
+      setLastSeenById((prev) => {
+        const next = { ...prev };
+        seen.forEach((u) => {
+          // Don't let a stale list response overwrite a fresher presence event.
+          if (!next[u.id] || next[u.id] < (u.lastSeen as string)) next[u.id] = u.lastSeen as string;
+        });
+        return next;
+      });
+    }
     const onlineIds = users.filter((u) => u.isOnline).map((u) => u.id);
     if (onlineIds.length === 0) return;
     setOnlineUserIds((prev) => {
@@ -98,6 +118,48 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         else next.delete(update.userId);
         return next;
       });
+      const { lastSeen } = update;
+      if (lastSeen) {
+        setLastSeenById((prev) => ({ ...prev, [update.userId]: lastSeen }));
+      }
+    }
+
+    const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    function setTyping(threadId: string, userId: string, isTyping: boolean) {
+      setTypingByThread((prev) => {
+        const current = prev[threadId] ?? [];
+        const has = current.includes(userId);
+        if (isTyping === has) return prev;
+        const next = isTyping ? [...current, userId] : current.filter((id) => id !== userId);
+        return { ...prev, [threadId]: next };
+      });
+    }
+
+    function handleTypingUpdate(update: TypingUpdate) {
+      const threadId = update.groupId ?? update.conversationId;
+      if (!threadId || update.userId === user?.id) return;
+      const key = `${threadId}:${update.userId}`;
+      const existing = typingTimers.get(key);
+      if (existing) clearTimeout(existing);
+      setTyping(threadId, update.userId, update.isTyping);
+      if (update.isTyping) {
+        typingTimers.set(
+          key,
+          setTimeout(() => {
+            typingTimers.delete(key);
+            setTyping(threadId, update.userId, false);
+          }, TYPING_STALE_MS)
+        );
+      } else {
+        typingTimers.delete(key);
+      }
+    }
+
+    // A new message from someone means they've stopped typing it.
+    function clearTypingForMessage(raw: Message) {
+      const threadId = raw.groupId ?? raw.conversationId;
+      const senderId = normalizeIds(raw).sender?.id;
+      if (threadId && senderId) setTyping(threadId, senderId, false);
     }
 
     // Rooms are otherwise only assigned when a socket connects, so being added
@@ -109,6 +171,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }
 
     socket.on("message:new", handleNewMessage);
+    socket.on("message:new", clearTypingForMessage);
+    socket.on("typing:update", handleTypingUpdate);
     socket.on("presence:update", handlePresence);
     socket.on("conversation:created", handleThreadCreatedOrUpdated);
     socket.on("group:created", handleThreadCreatedOrUpdated);
@@ -116,12 +180,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
     return () => {
       socket.off("message:new", handleNewMessage);
+      socket.off("message:new", clearTypingForMessage);
+      socket.off("typing:update", handleTypingUpdate);
+      typingTimers.forEach((timer) => clearTimeout(timer));
       socket.off("presence:update", handlePresence);
       socket.off("conversation:created", handleThreadCreatedOrUpdated);
       socket.off("group:created", handleThreadCreatedOrUpdated);
       socket.off("group:updated", handleThreadCreatedOrUpdated);
     };
-  }, [socket, upsertThreadFromMessage, refresh]);
+  }, [socket, upsertThreadFromMessage, refresh, user?.id]);
 
   // Keep active thread in sync if it gets updated (e.g. group membership changes)
   useEffect(() => {
@@ -142,6 +209,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         onlineUserIds,
         upsertThreadFromMessage,
         seedOnline,
+        lastSeenById,
+        typingByThread,
       }}
     >
       {children}

@@ -1,45 +1,47 @@
 import { useState } from "react";
-import { Box, useMediaQuery, useTheme } from "@mui/material";
+import { Box, Drawer, useMediaQuery, useTheme } from "@mui/material";
 import { Sidebar } from "../components/Sidebar";
 import { ChatWindow } from "../components/ChatWindow";
-import { CreateGroupDialog } from "../components/CreateGroupDialog";
-import { ChatProvider, useChat } from "../context/ChatContext";
+import { GroupInfoPanel } from "../components/GroupInfoPanel";
+import { useChat } from "../context/ChatContext";
 
-function ChatLayout({ onCreateGroup }: { onCreateGroup: () => void }) {
+export default function ChatPage() {
   const { activeThread } = useChat();
   const theme = useTheme();
-  const isMobile = useMediaQuery(theme.breakpoints.down("sm"));
+  const isDesktop = useMediaQuery(theme.breakpoints.up("lg"));
+  const isMobile = useMediaQuery(theme.breakpoints.down("md"));
+  // Remember which group the panel was opened for, so switching threads closes it.
+  const [membersFor, setMembersFor] = useState<string | null>(null);
 
-  if (!isMobile) {
+  const group = activeThread?.isGroup ? activeThread : null;
+  const membersOpen = !!group && membersFor === group.id;
+  const toggleMembers = () => setMembersFor(membersOpen ? null : group?.id ?? null);
+  const closeMembers = () => setMembersFor(null);
+
+  if (isMobile) {
     return (
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: "340px 1fr",
-          height: "100vh",
-          overflow: "hidden",
-        }}
-      >
-        <Sidebar onCreateGroup={onCreateGroup} />
-        <ChatWindow />
+      <Box sx={{ flex: 1, minWidth: 0, display: "flex" }}>
+        {!activeThread ? (
+          <Sidebar variant="mobile" />
+        ) : group && membersOpen ? (
+          <GroupInfoPanel group={group} onClose={closeMembers} variant="page" />
+        ) : (
+          <ChatWindow mobile membersOpen={false} onToggleMembers={toggleMembers} />
+        )}
       </Box>
     );
   }
 
   return (
-    <Box sx={{ height: "100vh", overflow: "hidden" }}>
-      {activeThread ? <ChatWindow /> : <Sidebar onCreateGroup={onCreateGroup} />}
+    <Box sx={{ flex: 1, minWidth: 0, display: "flex" }}>
+      <Sidebar />
+      <ChatWindow membersOpen={membersOpen && isDesktop} onToggleMembers={toggleMembers} />
+      {group && isDesktop && membersOpen && <GroupInfoPanel group={group} onClose={closeMembers} />}
+      {group && !isDesktop && (
+        <Drawer anchor="right" open={membersOpen} onClose={closeMembers} slotProps={{ paper: { sx: { width: 340, maxWidth: "100%" } } }}>
+          <GroupInfoPanel group={group} onClose={closeMembers} variant="drawer" />
+        </Drawer>
+      )}
     </Box>
-  );
-}
-
-export default function ChatPage() {
-  const [groupDialogOpen, setGroupDialogOpen] = useState(false);
-
-  return (
-    <ChatProvider>
-      <ChatLayout onCreateGroup={() => setGroupDialogOpen(true)} />
-      <CreateGroupDialog open={groupDialogOpen} onClose={() => setGroupDialogOpen(false)} />
-    </ChatProvider>
   );
 }
